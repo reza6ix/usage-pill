@@ -129,7 +129,7 @@ function ring(pct) {
     g.arc(cx, cy, r, 0, Math.PI * 2);
     g.stroke();
     if (pct != null && pct > 0) {
-      g.strokeStyle = CU.color(pct);
+      g.strokeStyle = CU.iconColor(pct);
       g.beginPath();
       g.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + (Math.PI * 2 * Math.max(pct, 2)) / 100);
       g.stroke();

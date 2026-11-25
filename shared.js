@@ -13,10 +13,80 @@
   };
   const ORDER = Object.keys(LABELS);
 
-  CU.COLORS = { low: '#4ade80', mid: '#fbbf24', high: '#f87171', none: '#71717a' };
+  // UI: monochrome until it matters. Toolbar icon keeps saturated colours so it reads on light toolbars too.
+  CU.COLORS = { low: '#f5f5f4', mid: '#fbbf24', high: '#fb7185', none: '#52525b' };
+  CU.ICON_COLORS = { low: '#22c55e', mid: '#f59e0b', high: '#ef4444', none: '#71717a' };
 
   CU.level = (pct) => (pct == null ? 'none' : pct >= 80 ? 'high' : pct >= 50 ? 'mid' : 'low');
   CU.color = (pct) => CU.COLORS[CU.level(pct)];
+  CU.iconColor = (pct) => CU.ICON_COLORS[CU.level(pct)];
+
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  CU.esc = esc;
+
+  CU.ICONS = {
+    refresh: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>',
+    external: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7"/><path d="M8 7h9v9"/></svg>',
+    eyeOff: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.7 5.1A10 10 0 0 1 12 5c5 0 9 4.5 10 7a13 13 0 0 1-2.2 3.3M6.6 6.6C4.3 8 2.7 10.2 2 12c1 2.5 5 7 10 7 1.9 0 3.6-.6 5-1.5"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/><path d="m3 3 18 18"/></svg>',
+  };
+
+  const SEGMENTS = 24;
+  /** One limit: label, big number, countdown, segmented level meter. */
+  CU.limitsHTML = (limits, now = Date.now()) =>
+    limits.map((l) => {
+      const on = l.pct > 0 ? Math.max(1, Math.round((l.pct / 100) * SEGMENTS)) : 0;
+      const segs = Array.from({ length: SEGMENTS }, (_, i) => `<i${i < on ? ' class="on"' : ''}></i>`).join('');
+      const right = l.resetsAt
+        ? `<b>${esc(CU.fmtLeft(l.resetsAt - now))}</b><span>resets ${esc(CU.fmtResetAt(l.resetsAt))}</span>`
+        : `<b>—</b><span>starts on next message</span>`;
+      return `<div class="lim lvl-${CU.level(l.pct)}">
+        <div class="lim-label">${esc(l.label)}</div>
+        <div class="lim-top"><div class="lim-num">${Math.round(l.pct)}<small>%</small></div><div class="lim-reset">${right}</div></div>
+        <div class="meter">${segs}</div></div>`;
+    }).join('');
+
+  CU.messageHTML = (status, error) =>
+    status === 'signed_out'
+      ? `<p class="msg">You're signed out. <a href="https://claude.ai/login" target="_blank" rel="noopener">Log in to claude.ai</a> and this fills in on its own.</p>`
+      : status === 'error'
+      ? `<p class="msg">Couldn't reach claude.ai (${esc(error || 'error')}). Opening <a href="https://claude.ai" target="_blank" rel="noopener">claude.ai</a> in a tab usually fixes it.</p>`
+      : `<p class="msg">Loading…</p>`;
+
+  /** Shared look for the popup and the in-page card. */
+  CU.CARD_CSS = `
+  .card { --fg:#f5f5f4; --mut:rgba(245,245,244,.46); --line:rgba(255,255,255,.07);
+          font: 500 12px/1.2 "SF Pro Text", -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
+          color: var(--fg); -webkit-font-smoothing: antialiased; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+  .card-head { display:flex; align-items:center; gap:8px; margin-bottom:16px; }
+  .card-head .mark { width:6px; height:6px; border-radius:50%; background:#d97757; box-shadow:0 0 10px rgba(217,119,87,.8); }
+  .card-head .t { font-size:12px; font-weight:600; color:var(--fg); letter-spacing:0; }
+  .lim + .lim { margin-top:18px; }
+  .lim-label { font-size:10px; font-weight:600; letter-spacing:.09em; text-transform:uppercase; color:var(--mut); margin-bottom:6px; }
+  .lim-top { display:flex; align-items:flex-end; justify-content:space-between; gap:12px; }
+  .lim-num { font-size:30px; font-weight:600; letter-spacing:-.04em; line-height:.9; }
+  .lim-num small { font-size:15px; font-weight:500; color:var(--mut); margin-left:1px; letter-spacing:0; }
+  .lim-reset { text-align:right; line-height:1.3; }
+  .lim-reset b { display:block; font-size:13px; font-weight:600; }
+  .lim-reset span { display:block; font-size:11px; color:var(--mut); }
+  .meter { display:grid; grid-template-columns:repeat(${SEGMENTS},1fr); gap:3px; margin-top:10px; }
+  .meter i { height:7px; border-radius:2px; background:rgba(255,255,255,.08); }
+  .lvl-low  .meter i.on { background:#f5f5f4; }
+  .lvl-mid  .meter i.on { background:#fbbf24; box-shadow:0 0 8px rgba(251,191,36,.45); }
+  .lvl-high .meter i.on { background:#fb7185; box-shadow:0 0 8px rgba(251,113,133,.5); }
+  .lvl-mid .lim-num { color:#fcd34d; } .lvl-high .lim-num { color:#fda4af; }
+  .msg { color:rgba(245,245,244,.78); line-height:1.5; font-weight:450; }
+  .msg a { color:#f0a487; }
+  .card-foot { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:18px; padding-top:12px; border-top:1px solid var(--line); }
+  .btn { all:unset; box-sizing:border-box; display:inline-flex; align-items:center; gap:7px; height:30px; padding:0 13px 0 11px; border-radius:999px;
+         background:rgba(255,255,255,.08); color:var(--fg); font-size:12px; font-weight:550; cursor:pointer; transition:background .15s, transform .1s; }
+  .btn:hover { background:rgba(255,255,255,.14); } .btn:active { transform:scale(.97); }
+  .btn.busy svg { animation: cu-spin .7s linear infinite; } @keyframes cu-spin { to { transform: rotate(360deg); } }
+  .icons { display:flex; gap:2px; }
+  .ibtn { all:unset; box-sizing:border-box; width:30px; height:30px; display:grid; place-items:center; border-radius:999px; color:var(--mut); cursor:pointer; text-decoration:none; }
+  .ibtn:hover { background:rgba(255,255,255,.08); color:var(--fg); }
+  .note { display:flex; justify-content:space-between; align-items:center; margin-top:10px; font-size:11px; color:var(--mut); }
+  .note button { all:unset; cursor:pointer; color:var(--fg); text-decoration:underline; text-underline-offset:2px; }
+  [hidden] { display:none !important; }`;
 
   /** Turn the raw API payload into a sorted list of {key, label, pct, resetsAt}. */
   CU.normalize = (raw) => {
