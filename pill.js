@@ -26,7 +26,9 @@
 
   // ---------- DOM ----------
   const host = document.createElement('div');
-  host.style.cssText = 'all:initial;position:fixed;z-index:2147483647;display:none;';
+  // Anchored to the bottom-right of the page, then moved/scaled with a transform so it
+  // follows the *visible* area at any zoom (⌘+ or trackpad pinch) and keeps its size.
+  host.style.cssText = 'all:initial;position:fixed;right:0;bottom:0;transform-origin:100% 100%;z-index:2147483647;display:none;';
   const root = host.attachShadow({ mode: 'closed' });
   const SPRING = 'cubic-bezier(.2,.9,.25,1.15)';
   root.innerHTML = `
@@ -118,27 +120,52 @@
     applyPos();
   }
 
-  /** Position from the bottom-right; with no saved spot, sit centred at the bottom. */
+  // ---------- zoom-proof positioning ----------
+  // Positions are stored in "screen units" (px at 100% zoom), measured from the
+  // bottom-right of what you can actually see.
+  let pageZoom = 1; // ⌘+/⌘− factor, reported by the background worker
+  let cur = { right: 0, bottom: 0 };
+  const vv = window.visualViewport;
+  const scale = () => 1 / (pageZoom * (vv ? vv.scale : 1)); // layout px per screen unit
+  const view = () => (vv
+    ? { x: vv.offsetLeft, y: vv.offsetTop, w: vv.width, h: vv.height }
+    : { x: 0, y: 0, w: innerWidth, h: innerHeight });
+  const clamp = (n, lo, hi) => Math.min(Math.max(n, lo), Math.max(lo, hi));
+
   function applyPos() {
-    const r = pill.getBoundingClientRect();
-    const w = r.width || 120, h = r.height || 30;
-    const pos = state.pillPos || { right: (innerWidth - w) / 2, bottom: 24 };
-    const right = Math.min(Math.max(pos.right, 8), innerWidth - w - 8);
-    const bottom = Math.min(Math.max(pos.bottom, 8), innerHeight - h - 8);
-    host.style.right = `${right}px`;
-    host.style.bottom = `${bottom}px`;
-    placePanel();
+    const s = scale(), v = view();
+    const w = pill.offsetWidth || 120, h = pill.offsetHeight || 30;
+    const W = v.w / s, H = v.h / s; // visible area in screen units
+    const pos = state.pillPos || { right: (W - w) / 2, bottom: 24 };
+    cur = { right: clamp(pos.right, 8, W - w - 8), bottom: clamp(pos.bottom, 8, H - h - 8) };
+    const de = document.documentElement;
+    const tx = v.x + v.w - cur.right * s - de.clientWidth;
+    const ty = v.y + v.h - cur.bottom * s - de.clientHeight;
+    host.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
+    placePanel(W, H, w);
   }
 
-  function placePanel() {
-    const r = pill.getBoundingClientRect();
-    const cx = r.left + r.width / 2;
-    const up = r.top > innerHeight / 2;
+  function placePanel(W, H, w) {
+    const up = cur.bottom < H / 2;
     wrap.classList.toggle('up', up);
     wrap.classList.toggle('down', !up);
-    const side = cx < 170 ? 'alignL' : cx > innerWidth - 170 ? 'alignR' : 'alignC';
+    const cx = W - cur.right - w / 2;
+    const side = cx < 170 ? 'alignL' : cx > W - 170 ? 'alignR' : 'alignC';
     for (const c of ['alignL', 'alignR', 'alignC']) wrap.classList.toggle(c, c === side);
   }
+
+  let rafPending = false;
+  const schedulePos = () => {
+    if (rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(() => { rafPending = false; if (host.style.display !== 'none') applyPos(); });
+  };
+  vv?.addEventListener('resize', schedulePos);
+  vv?.addEventListener('scroll', schedulePos);
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg?.type === 'zoom' && msg.zoom > 0) { pageZoom = msg.zoom; schedulePos(); }
+  });
+  send({ type: 'get-zoom' }).then((z) => { if (z > 0) { pageZoom = z; schedulePos(); } });
 
   // ---------- hover to expand ----------
   let openT, closeT, dragging = false;
@@ -155,14 +182,14 @@
   // ---------- drag ----------
   pill.addEventListener('pointerdown', (e) => {
     if (e.button !== 0) return;
-    const start = { x: e.clientX, y: e.clientY, right: parseFloat(host.style.right), bottom: parseFloat(host.style.bottom) };
+    const start = { x: e.clientX, y: e.clientY, ...cur, s: scale() };
     let moved = false;
     pill.setPointerCapture(e.pointerId);
     const move = (ev) => {
       const dx = ev.clientX - start.x, dy = ev.clientY - start.y;
       if (!moved && Math.hypot(dx, dy) < 4) return;
       if (!moved) { moved = dragging = true; wrap.classList.add('dragging'); wrap.classList.remove('open'); }
-      state.pillPos = { right: start.right - dx, bottom: start.bottom - dy };
+      state.pillPos = { right: start.right - dx / start.s, bottom: start.bottom - dy / start.s };
       applyPos();
     };
     const up = () => {
@@ -171,7 +198,7 @@
       pill.removeEventListener('pointercancel', up);
       wrap.classList.remove('dragging');
       if (moved && alive()) {
-        state.pillPos = { right: parseFloat(host.style.right), bottom: parseFloat(host.style.bottom) };
+        state.pillPos = { ...cur };
         chrome.storage.local.set({ pillPos: state.pillPos });
       } else {
         wrap.classList.toggle('open'); // tap = toggle the card (handy on trackpads)
@@ -228,5 +255,5 @@
     if (!state.usage || Date.now() - state.usage.fetchedAt > 60_000) send({ type: 'refresh' });
   });
   document.addEventListener('fullscreenchange', render);
-  addEventListener('resize', applyPos);
+  addEventListener('resize', schedulePos);
 })();

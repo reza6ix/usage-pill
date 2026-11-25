@@ -37,7 +37,16 @@ chrome.commands.onCommand.addListener(async (cmd) => {
   chrome.storage.local.set({ pillEnabled: !pillEnabled });
 });
 
-chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
+// Tell each tab its ⌘+/⌘− zoom so the pill can stay the same size.
+chrome.tabs.onZoomChange.addListener(({ tabId, newZoomFactor }) => {
+  chrome.tabs.sendMessage(tabId, { type: 'zoom', zoom: newZoomFactor }).catch(() => {});
+});
+
+chrome.runtime.onMessage.addListener((msg, sender, reply) => {
+  if (msg?.type === 'get-zoom' && sender.tab?.id != null) {
+    chrome.tabs.getZoom(sender.tab.id).then(reply, () => reply(1));
+    return true;
+  }
   if (msg?.type === 'refresh') {
     refresh(!!msg.force).then(() => reply({ ok: true }));
     return true;
