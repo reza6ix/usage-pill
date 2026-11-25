@@ -136,7 +136,7 @@
     const s = scale(), v = view();
     const w = pill.offsetWidth || 120, h = pill.offsetHeight || 30;
     const W = v.w / s, H = v.h / s; // visible area in screen units
-    const pos = state.pillPos || { right: (W - w) / 2, bottom: 24 };
+    const pos = state.pillPos || { right: 20, bottom: 20 }; // default: bottom-right corner
     cur = { right: clamp(pos.right, 8, W - w - 8), bottom: clamp(pos.bottom, 8, H - h - 8) };
     const de = document.documentElement;
     const tx = v.x + v.w - cur.right * s - de.clientWidth;
@@ -209,7 +209,7 @@
     pill.addEventListener('pointerup', up);
     pill.addEventListener('pointercancel', up);
   });
-  // Double-click the pill to send it back to the bottom-centre.
+  // Double-click the pill to send it back to the bottom-right corner.
   pill.addEventListener('dblclick', () => { state.pillPos = null; chrome.storage.local.remove('pillPos'); applyPos(); });
 
   // ---------- card buttons ----------

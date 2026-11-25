@@ -2,7 +2,7 @@
 
 A tiny always-on pill that shows your Claude usage and how long until it resets — on every tab, without opening Settings → Usage.
 
-- **Floating pill** on every page: `23% · 2h 14m`. Drag it anywhere; hover for session + weekly limits.
+- **Floating pill** on every page: `23% · 2h 14m`. Sits in the bottom-right corner — drag it anywhere (double-click to send it back); hover for session + weekly limits.
 - **Live toolbar icon**: the ring fills as you use your limit, the badge counts down to the reset.
 - **⌥⇧U** (Alt+Shift+U) shows / hides the pill. "Hide on this site" for pages where it's in the way.
 - Turns amber at 50% and red at 80%.
