@@ -1,421 +1,11 @@
-// Usage Pill — a floating Claude usage widget for macOS.
-// Shows over every app and Space. Data is pushed to it by the browser extension
-// (POST http://127.0.0.1:47823/usage), so this app never touches your login.
+// Usage Pill — app shell: floating windows, local server, menu bar.
+// Models and views live in UI.swift (shared with promo/ which renders the demo video).
 
 import AppKit
 import SwiftUI
 import Network
 import Combine
 import ServiceManagement
-import CryptoKit
-
-let PORT: UInt16 = 47823
-let USAGE_URL = URL(string: "https://claude.ai/settings/usage")!
-let PILL_PAD: CGFloat = 14   // transparent room around the pill for its shadow
-let CARD_PAD: CGFloat = 22   // same for the card
-
-// MARK: - Model
-
-struct Limit: Codable, Identifiable, Equatable {
-    let key: String
-    let label: String
-    let pct: Double
-    let resetsAt: Double? // ms since epoch
-    var id: String { key }
-    var resetDate: Date? { resetsAt.map { Date(timeIntervalSince1970: $0 / 1000) } }
-}
-
-struct Payload: Codable {
-    let limits: [Limit]?
-    let fetchedAt: Double?
-    let status: String?
-}
-
-// Where the numbers come from: a Claude Code config folder (its own login, read from
-// the macOS Keychain), or the browser extension (whatever account claude.ai is logged into).
-let HOME = NSHomeDirectory()
-enum Sources {
-    static let browser = "browser"
-    static func all() -> [String] {
-        let fm = FileManager.default
-        let names = (try? fm.contentsOfDirectory(atPath: HOME)) ?? []
-        let dirs = names.filter { $0 == ".claude" || $0.hasPrefix(".claude-") }.sorted().map { HOME + "/" + $0 }
-            .filter { var isDir: ObjCBool = false; return fm.fileExists(atPath: $0, isDirectory: &isDir) && isDir.boolValue }
-        return dirs + [browser]
-    }
-    static func label(_ s: String) -> String {
-        if s == browser { return "browser" }
-        let n = (s as NSString).lastPathComponent
-        return n == ".claude" ? "Claude Code" : String(n.dropFirst(".claude-".count))
-    }
-    static func menuTitle(_ s: String) -> String {
-        s == browser ? "Browser extension (claude.ai login)" : "Claude Code · ~/\((s as NSString).lastPathComponent)"
-    }
-    static var fallback: String { all().first { $0 == HOME + "/.claude" } ?? all().first ?? browser }
-}
-
-final class Store: ObservableObject {
-    @Published var limits: [Limit] = []
-    @Published var fetchedAt: Date?
-    @Published var status: String?
-    @Published var lastPush: Date?
-    @Published var now = Date()
-    @Published var pillHover = false
-    @Published var refreshing = false
-    @Published var source: String
-
-    private var timer: Timer?
-    private var saveKey: String { "lastPayload|" + source }
-
-    init() {
-        let saved = UserDefaults.standard.string(forKey: "source")
-        source = saved.flatMap { Sources.all().contains($0) ? $0 : nil } ?? Sources.fallback
-        restore()
-        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in self?.now = Date() }
-    }
-
-    var isBrowser: Bool { source == Sources.browser }
-
-    func setSource(_ s: String) {
-        guard s != source else { return }
-        source = s
-        UserDefaults.standard.set(s, forKey: "source")
-        limits = []; fetchedAt = nil; status = nil
-        restore()
-    }
-
-    private func restore() {
-        if let d = UserDefaults.standard.data(forKey: saveKey),
-           let p = try? JSONDecoder().decode(Payload.self, from: d) { apply(p) }
-    }
-
-    private func persist() {
-        let p = Payload(limits: limits, fetchedAt: fetchedAt.map { $0.timeIntervalSince1970 * 1000 }, status: status)
-        if let d = try? JSONEncoder().encode(p) { UserDefaults.standard.set(d, forKey: saveKey) }
-    }
-
-    /** From the browser extension. Only used when the browser is the chosen source. */
-    func ingest(_ data: Data) {
-        lastPush = Date()
-        guard isBrowser, let p = try? JSONDecoder().decode(Payload.self, from: data) else { return }
-        apply(p)
-        if !limits.isEmpty { persist() }
-    }
-
-    /** From api.anthropic.com/api/oauth/usage (Claude Code login). */
-    func applyRaw(_ raw: [String: Any]) {
-        let l = normalize(raw)
-        guard !l.isEmpty else { status = "error"; return }
-        limits = l
-        fetchedAt = Date()
-        status = "ok"
-        now = Date()
-        persist()
-    }
-
-    private func apply(_ p: Payload) {
-        if let l = p.limits, !l.isEmpty { limits = l }
-        if let f = p.fetchedAt { fetchedAt = Date(timeIntervalSince1970: f / 1000) }
-        status = p.status
-        now = Date()
-    }
-
-    var primary: Limit? { limits.first { $0.key == "five_hour" } ?? limits.first }
-    var stale: Bool { fetchedAt.map { now.timeIntervalSince($0) > 10 * 60 } ?? true }
-    var browserConnected: Bool { lastPush.map { now.timeIntervalSince($0) < 5 * 60 } ?? false }
-}
-
-let LABELS = ["five_hour": "Session · 5h", "seven_day": "Weekly · all models", "seven_day_opus": "Weekly · Opus",
-              "seven_day_sonnet": "Weekly · Sonnet", "seven_day_oauth_apps": "Weekly · apps"]
-let ORDER = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_oauth_apps"]
-
-func parseISO(_ s: String) -> Date? {
-    let trimmed = s.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
-    return ISO8601DateFormatter().date(from: trimmed)
-}
-
-func normalize(_ raw: [String: Any]) -> [Limit] {
-    var out: [Limit] = []
-    for (k, v) in raw {
-        guard let d = v as? [String: Any], let u = (d["utilization"] as? NSNumber)?.doubleValue else { continue }
-        let ts = (d["resets_at"] as? String).flatMap(parseISO).map { $0.timeIntervalSince1970 * 1000 }
-        out.append(Limit(key: k, label: LABELS[k] ?? k.replacingOccurrences(of: "_", with: " ").capitalized,
-                         pct: min(100, max(0, u)), resetsAt: ts))
-    }
-    return out.sorted { (ORDER.firstIndex(of: $0.key) ?? 99, $0.key) < (ORDER.firstIndex(of: $1.key) ?? 99, $1.key) }
-}
-
-// MARK: - Claude Code login → usage
-
-enum ClaudeCode {
-    /// Claude Code's Keychain item: plain for ~/.claude, suffixed with a hash of the folder otherwise.
-    static func keychainService(_ dir: String) -> String {
-        if dir == HOME + "/.claude" { return "Claude Code-credentials" }
-        let h = SHA256.hash(data: Data(dir.utf8)).map { String(format: "%02x", $0) }.joined()
-        return "Claude Code-credentials-" + h.prefix(8)
-    }
-
-    /// Reads the access token. Never logged, never stored, never refreshed (refreshing would sign Claude Code out).
-    static func accessToken(_ dir: String) -> String? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = ["find-generic-password", "-s", keychainService(dir), "-w"]
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        var data = Data()
-        if (try? p.run()) != nil {
-            data = out.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            if p.terminationStatus != 0 { data = Data() }
-        }
-        if data.isEmpty { data = (try? Data(contentsOf: URL(fileURLWithPath: dir + "/.credentials.json"))) ?? Data() }
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = obj["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String, !token.isEmpty else { return nil }
-        return token
-    }
-
-    static func fetch(_ dir: String, done: @escaping (Int, [String: Any]?) -> Void) {
-        DispatchQueue.global(qos: .utility).async {
-            guard let token = accessToken(dir) else { return DispatchQueue.main.async { done(-1, nil) } }
-            var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!, timeoutInterval: 15)
-            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-            req.setValue("application/json", forHTTPHeaderField: "Accept")
-            URLSession.shared.dataTask(with: req) { data, resp, _ in
-                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-                DispatchQueue.main.async { done(code, json) }
-            }.resume()
-        }
-    }
-}
-
-
-// MARK: - Formatting
-
-enum Fmt {
-    static func left(_ d: Date?, now: Date) -> String {
-        guard let d else { return "—" }
-        let s = d.timeIntervalSince(now)
-        if s <= 0 { return "now" }
-        let m = Int((s / 60).rounded(.up))
-        if m < 60 { return "\(m)m" }
-        let h = m / 60, mm = m % 60
-        if h < 24 { return mm > 0 ? "\(h)h \(mm)m" : "\(h)h" }
-        let dd = h / 24, hh = h % 24
-        return hh > 0 ? "\(dd)d \(hh)h" : "\(dd)d"
-    }
-    static func resetAt(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = Calendar.current.isDateInToday(d) ? "h:mm a" : "EEE h:mm a"
-        return f.string(from: d)
-    }
-    static func ago(_ d: Date?, now: Date) -> String {
-        guard let d else { return "never" }
-        let s = Int(now.timeIntervalSince(d))
-        if s < 30 { return "just now" }
-        if s < 3600 { return "\(max(1, s / 60))m ago" }
-        return "\(s / 3600)h ago"
-    }
-}
-
-// MARK: - Style
-
-enum Style {
-    static let bg = Color(red: 0.043, green: 0.043, blue: 0.047)
-    static let fg = Color(red: 0.96, green: 0.96, blue: 0.957)
-    static let muted = Color(red: 0.96, green: 0.96, blue: 0.957).opacity(0.46)
-    static let amber = Color(red: 0.984, green: 0.749, blue: 0.141)
-    static let rose = Color(red: 0.984, green: 0.443, blue: 0.522)
-    static let accent = Color(red: 0.851, green: 0.467, blue: 0.341)
-    static func level(_ pct: Double) -> Color { pct >= 80 ? rose : pct >= 50 ? amber : fg }
-}
-
-// MARK: - Views
-
-struct Ring: View {
-    let pct: Double?
-    var body: some View {
-        ZStack {
-            Circle().stroke(Color.white.opacity(0.14), lineWidth: 2.6)
-            if let pct, pct > 0 {
-                Circle()
-                    .trim(from: 0, to: CGFloat(max(pct, 2) / 100))
-                    .stroke(Style.level(pct), style: StrokeStyle(lineWidth: 2.6, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
-            }
-        }
-        .frame(width: 14, height: 14)
-        .animation(.easeOut(duration: 0.5), value: pct)
-    }
-}
-
-struct PillView: View {
-    @ObservedObject var store: Store
-    var body: some View {
-        let p = store.primary
-        HStack(spacing: 8) {
-            Ring(pct: p?.pct)
-            Text(p.map { "\(Int($0.pct.rounded()))%" } ?? "—")
-                .font(.system(size: 12, weight: .semibold))
-            Rectangle().fill(Color.white.opacity(0.16)).frame(width: 1, height: 12)
-            Text(p.map { $0.resetDate == nil ? "idle" : Fmt.left($0.resetDate, now: store.now) } ?? "Claude")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundColor(Style.fg.opacity(0.6))
-        }
-        .monospacedDigit()
-        .foregroundColor(Style.fg)
-        .padding(.leading, 9).padding(.trailing, 13)
-        .frame(height: 30)
-        .background(Capsule().fill(Style.bg))
-        .overlay(Capsule().strokeBorder(Color.white.opacity(store.pillHover ? 0.2 : 0.11), lineWidth: 1))
-        .shadow(color: .black.opacity(0.35), radius: 7, y: 3)
-        .scaleEffect(store.pillHover ? 1.04 : 1, anchor: .trailing)
-        .opacity(store.stale && !store.limits.isEmpty ? 0.6 : 1)
-        .animation(.spring(response: 0.3, dampingFraction: 0.7), value: store.pillHover)
-        .padding(PILL_PAD)
-        .fixedSize()
-    }
-}
-
-struct Meter: View {
-    let pct: Double
-    var body: some View {
-        let n = 24
-        let on = pct > 0 ? max(1, Int((pct / 100 * Double(n)).rounded())) : 0
-        let c = Style.level(pct)
-        HStack(spacing: 3) {
-            ForEach(0..<n, id: \.self) { i in
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
-                    .fill(i < on ? c : Color.white.opacity(0.08))
-                    .frame(height: 7)
-                    .shadow(color: i < on && pct >= 50 ? c.opacity(0.45) : .clear, radius: 4)
-            }
-        }
-    }
-}
-
-struct LimitRow: View {
-    let limit: Limit
-    let now: Date
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(limit.label.uppercased())
-                .font(.system(size: 10, weight: .semibold)).tracking(0.9)
-                .foregroundColor(Style.muted)
-                .padding(.bottom, 6)
-            HStack(alignment: .bottom) {
-                HStack(alignment: .lastTextBaseline, spacing: 1) {
-                    Text("\(Int(limit.pct.rounded()))")
-                        .font(.system(size: 30, weight: .semibold)).tracking(-1.2)
-                        .foregroundColor(limit.pct >= 50 ? Style.level(limit.pct) : Style.fg)
-                    Text("%").font(.system(size: 15, weight: .medium)).foregroundColor(Style.muted)
-                }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text(limit.resetDate != nil ? Fmt.left(limit.resetDate, now: now) : "—")
-                        .font(.system(size: 13, weight: .semibold))
-                    Text(limit.resetDate.map { "resets \(Fmt.resetAt($0))" } ?? "starts on next message")
-                        .font(.system(size: 11)).foregroundColor(Style.muted)
-                }
-            }
-            .monospacedDigit()
-            Meter(pct: limit.pct).padding(.top, 10)
-        }
-    }
-}
-
-struct CardView: View {
-    @ObservedObject var store: Store
-    let onRefresh: () -> Void
-    let onOpen: () -> Void
-
-    var message: String {
-        switch store.status {
-        case "no_login": return "No Claude Code login found for ~/\((store.source as NSString).lastPathComponent). Run Claude Code there once, then hit Refresh."
-        case "expired": return "Claude Code's login for this account expired. Run it once (it refreshes itself), then hit Refresh."
-        case "signed_out": return "You're signed out of claude.ai in your browser."
-        case "error": return "Couldn't load usage. Check your connection and hit Refresh."
-        default:
-            if store.isBrowser && store.lastPush == nil { return "Waiting for the browser extension. Keep your browser open with Usage Pill installed." }
-            return "Loading…"
-        }
-    }
-
-    var footer: String {
-        if store.isBrowser && !store.browserConnected && store.fetchedAt != nil { return "Browser closed · \(Fmt.ago(store.fetchedAt, now: store.now))" }
-        if store.status == "expired" || store.status == "error" || store.status == "no_login" { return store.fetchedAt == nil ? "Not updated" : "Offline · \(Fmt.ago(store.fetchedAt, now: store.now))" }
-        return "Updated \(Fmt.ago(store.fetchedAt, now: store.now))"
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                Circle().fill(Style.accent).frame(width: 6, height: 6).shadow(color: Style.accent.opacity(0.8), radius: 5)
-                Text("Claude usage").font(.system(size: 12, weight: .semibold))
-                Text(Sources.label(store.source)).font(.system(size: 11, weight: .medium)).foregroundColor(Style.muted)
-                    .padding(.horizontal, 7).frame(height: 18)
-                    .background(Capsule().fill(Color.white.opacity(0.07)))
-            }
-            .padding(.bottom, 16)
-
-            if store.limits.isEmpty {
-                Text(message).font(.system(size: 12)).foregroundColor(Style.fg.opacity(0.75))
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                ForEach(Array(store.limits.enumerated()), id: \.element.id) { i, l in
-                    LimitRow(limit: l, now: store.now).padding(.top, i == 0 ? 0 : 18)
-                }
-            }
-
-            Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1).padding(.top, 18)
-            HStack(spacing: 6) {
-                Text(footer).font(.system(size: 11)).foregroundColor(Style.muted)
-                Spacer()
-                if store.isBrowser {
-                    PillButton(title: "Usage page", icon: "arrow.up.right", action: onOpen)
-                } else {
-                    PillButton(title: store.refreshing ? "Refreshing" : "Refresh", icon: "arrow.clockwise",
-                               spinning: store.refreshing, action: onRefresh)
-                }
-            }
-            .padding(.top, 12)
-        }
-        .foregroundColor(Style.fg)
-        .padding(EdgeInsets(top: 16, leading: 16, bottom: 12, trailing: 16))
-        .frame(width: 300)
-        .background(RoundedRectangle(cornerRadius: 22, style: .continuous).fill(Style.bg))
-        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).strokeBorder(Color.white.opacity(0.1), lineWidth: 1))
-        .shadow(color: .black.opacity(0.4), radius: 14, y: 6)
-        .padding(CARD_PAD)
-        .fixedSize()
-    }
-}
-
-struct PillButton: View {
-    let title: String
-    let icon: String
-    var spinning = false
-    let action: () -> Void
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: icon).font(.system(size: 10, weight: .bold))
-                    .rotationEffect(.degrees(spinning ? 360 : 0))
-                    .animation(spinning ? .linear(duration: 0.7).repeatForever(autoreverses: false) : .default, value: spinning)
-                Text(title)
-            }
-            .font(.system(size: 12, weight: .medium))
-            .padding(.horizontal, 12).frame(height: 28)
-            .background(Capsule().fill(Color.white.opacity(0.08)))
-            .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-}
-
 
 // MARK: - Windows
 
@@ -436,23 +26,46 @@ final class FloatingPanel: NSPanel {
 }
 
 final class HoverHostingView<V: View>: NSHostingView<V> {
-    var onHover: ((Bool) -> Void)?
+    var onHover: (() -> Void)?
+    var hotInset: CGFloat = 0          // only the visible shape counts, not the shadow margin
     var dragsWindow = false
-    var onMouseDown: ((NSEvent) -> Void)?
+    var onClick: (() -> Void)?
+    var onDragStart: (() -> Void)?
+
+    private var downMouse: NSPoint?
+    private var downOrigin = NSPoint.zero
+    private var dragging = false
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         for t in trackingAreas where t.userInfo?["hover"] != nil { removeTrackingArea(t) }
-        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+        addTrackingArea(NSTrackingArea(rect: bounds.insetBy(dx: hotInset, dy: hotInset),
+                                       options: [.mouseEnteredAndExited, .activeAlways],
                                        owner: self, userInfo: ["hover": true]))
     }
-    override func mouseEntered(with e: NSEvent) { super.mouseEntered(with: e); onHover?(true) }
-    override func mouseExited(with e: NSEvent) { super.mouseExited(with: e); onHover?(false) }
+    override func mouseEntered(with e: NSEvent) { super.mouseEntered(with: e); onHover?() }
+    override func mouseExited(with e: NSEvent) { super.mouseExited(with: e); onHover?() }
     override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
+
+    // Click = toggle the card. Drag (> 3pt) = move the pill.
     override func mouseDown(with e: NSEvent) {
-        guard dragsWindow else { return super.mouseDown(with: e) }
-        onMouseDown?(e)
-        if e.clickCount < 2 { window?.performDrag(with: e) }
+        guard dragsWindow, let w = window else { return super.mouseDown(with: e) }
+        downMouse = NSEvent.mouseLocation
+        downOrigin = w.frame.origin
+        dragging = false
+    }
+    override func mouseDragged(with e: NSEvent) {
+        guard dragsWindow, let start = downMouse, let w = window else { return super.mouseDragged(with: e) }
+        let m = NSEvent.mouseLocation
+        let dx = m.x - start.x, dy = m.y - start.y
+        if !dragging && hypot(dx, dy) > 3 { dragging = true; onDragStart?() }
+        if dragging { w.setFrameOrigin(NSPoint(x: downOrigin.x + dx, y: downOrigin.y + dy)) }
+    }
+    override func mouseUp(with e: NSEvent) {
+        guard dragsWindow, downMouse != nil else { return super.mouseUp(with: e) }
+        if !dragging { onClick?() }
+        downMouse = nil
+        dragging = false
     }
 }
 
@@ -509,10 +122,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var card: FloatingPanel!
     var pillHost: HoverHostingView<PillView>!
     var cardHost: HoverHostingView<CardView>!
+    // Measure with a fresh off-screen copy each time (a reused one never re-measures);
+    // the on-screen views don't size their own windows.
+    var pillFit: NSSize { NSHostingView(rootView: PillView(store: store)).fittingSize }
+    var cardFit: NSSize { NSHostingView(rootView: CardView(store: store, onRefresh: {}, onOpen: {})).fittingSize }
     var statusItem: NSStatusItem!
     var bag = Set<AnyCancellable>()
-    var overPill = false, overCard = false
-    var showWork: DispatchWorkItem?, hideWork: DispatchWorkItem?
+    var hoverTimer: Timer?
+    var leaveWork: DispatchWorkItem?, shrinkWork: DispatchWorkItem?
+    var clickMonitor: Any?
     var lastPillSize = NSSize.zero
     var placing = false
 
@@ -526,19 +144,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         server = Server(port: PORT) { [weak self] d in self?.store.ingest(d) }
 
         pillHost = HoverHostingView(rootView: PillView(store: store))
+        pillHost.sizingOptions = [] // we size the windows ourselves; don't let SwiftUI pin a min size
         pillHost.dragsWindow = true
-        pillHost.onHover = { [weak self] h in self?.overPill = h; self?.store.pillHover = h; self?.hoverChanged() }
-        pillHost.onMouseDown = { [weak self] e in
-            self?.hideCard(animated: false)
-            if e.clickCount == 2 { self?.resetPosition() }
-        }
+        pillHost.hotInset = PILL_PAD
+        pillHost.onHover = { [weak self] in self?.syncHover() }
+        pillHost.onClick = { [weak self] in self?.toggleCard() }
+        pillHost.onDragStart = { [weak self] in self?.closeCard(animated: false) }
         pill = FloatingPanel(view: pillHost)
 
         cardHost = HoverHostingView(rootView: CardView(store: store,
                                                        onRefresh: { [weak self] in self?.fetchNow() },
                                                        onOpen: { NSWorkspace.shared.open(USAGE_URL) }))
-        cardHost.onHover = { [weak self] h in self?.overCard = h; self?.hoverChanged() }
+        cardHost.sizingOptions = []
+        cardHost.hotInset = CARD_PAD
+        cardHost.onHover = { [weak self] in self?.syncHover() }
         card = FloatingPanel(view: cardHost)
+
+        // A click anywhere else on screen closes the card (no extra permissions needed).
+        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            guard let self, self.store.cardOpen else { return }
+            self.closeCard(animated: true)
+        }
 
         NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification, object: pill, queue: .main) { [weak self] _ in
             guard let self, !self.placing else { return }
@@ -593,7 +219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // --- layout ---
 
     func placePill() {
-        let size = pillHost.fittingSize
+        let size = pillFit
         lastPillSize = size
         let screens = NSScreen.screens
         var maxX = defaults.object(forKey: "anchorMaxX") as? CGFloat
@@ -620,7 +246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func placeCard() {
-        let size = cardHost.fittingSize
+        let size = cardFit
         let pf = pill.frame
         let screen = (pill.screen ?? NSScreen.main ?? NSScreen.screens[0]).visibleFrame
         let pillVisible = pf.insetBy(dx: PILL_PAD, dy: PILL_PAD)
@@ -634,58 +260,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func refresh() {
         updateStatusItem()
-        let size = pillHost.fittingSize
-        if size != lastPillSize { placePill() }
+        let size = pillFit
+        if size != lastPillSize {
+            shrinkWork?.cancel(); shrinkWork = nil
+            if size.width < lastPillSize.width {
+                // Let the collapse animation finish before the window gets narrower.
+                let w = DispatchWorkItem { [weak self] in self?.placePill() }
+                shrinkWork = w
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.32, execute: w)
+            } else {
+                placePill()
+            }
+        }
         if card.isVisible { placeCard() }
     }
 
-    // --- hover card ---
+    // --- hover + click (Wispr Flow style) ---
+    // Hover the pill → it widens to show the countdown, instantly.
+    // Click the pill → the card opens. Move away or click elsewhere → it closes right away.
 
-    func hoverChanged() {
-        showWork?.cancel(); hideWork?.cancel()
-        if overPill || overCard {
-            guard !card.isVisible || card.alphaValue < 1 else { return }
-            let w = DispatchWorkItem { [weak self] in self?.showCard() }
-            showWork = w
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: w)
-        } else {
-            let w = DispatchWorkItem { [weak self] in self?.hideCard(animated: true) }
-            hideWork = w
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: w)
+    var pillHot: NSRect { pill.frame.insetBy(dx: PILL_PAD, dy: PILL_PAD) }
+    var cardHot: NSRect { card.frame.insetBy(dx: CARD_PAD, dy: CARD_PAD) }
+
+    /// Decide hover from the real pointer position against the visible shapes.
+    /// Runs on enter/exit and, while anything is open, ~60×/s so exits are never missed.
+    func syncHover() {
+        let m = NSEvent.mouseLocation
+        let inPill = pill.isVisible && pillHot.contains(m)
+        if store.pillHover != inPill { store.pillHover = inPill }
+
+        if store.cardOpen {
+            // The pill, the card and the small gap between them count as "inside".
+            let zone = pillHot.union(cardHot).insetBy(dx: -4, dy: -4)
+            if zone.contains(m) {
+                leaveWork?.cancel(); leaveWork = nil
+            } else if leaveWork == nil {
+                let w = DispatchWorkItem { [weak self] in self?.closeCard(animated: true) }
+                leaveWork = w
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: w)
+            }
+        }
+
+        let watching = inPill || store.cardOpen
+        if watching, hoverTimer == nil {
+            let t = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.syncHover() }
+            RunLoop.main.add(t, forMode: .common)
+            hoverTimer = t
+        } else if !watching {
+            hoverTimer?.invalidate(); hoverTimer = nil
         }
     }
 
-    func showCard() {
+    func toggleCard() { store.cardOpen ? closeCard(animated: true) : openCard() }
+
+    func openCard() {
         guard widgetOn, pill.isVisible else { return }
+        leaveWork?.cancel(); leaveWork = nil
+        store.cardOpen = true
         placeCard()
         let final = card.frame
-        let pillVisible = pill.frame.insetBy(dx: PILL_PAD, dy: PILL_PAD)
-        let dy: CGFloat = final.midY > pillVisible.midY ? -8 : 8
+        let pillVisible = pillHot
+        let dy: CGFloat = final.midY > pillVisible.midY ? -6 : 6
         card.setFrame(final.offsetBy(dx: 0, dy: dy), display: false)
         card.alphaValue = 0
         card.orderFrontRegardless()
         pill.orderFrontRegardless() // keep the pill above the card's transparent margin
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.22
-            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.1)
+            ctx.duration = 0.18
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.3, 1)
             card.animator().alphaValue = 1
             card.animator().setFrame(final, display: true)
         }
+        syncHover()
     }
 
-    func hideCard(animated: Bool) {
-        guard card.isVisible else { return }
+    func closeCard(animated: Bool) {
+        leaveWork?.cancel(); leaveWork = nil
+        guard store.cardOpen else { return }
+        store.cardOpen = false
+        syncHover()
         if !animated { card.orderOut(nil); return }
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.14
+            ctx.duration = 0.1
             card.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
-            guard let self else { return }
-            if self.overPill || self.overCard {
-                NSAnimationContext.runAnimationGroup { ctx in ctx.duration = 0.12; self.card.animator().alphaValue = 1 }
-            } else {
-                self.card.orderOut(nil)
-            }
+            guard let self, !self.store.cardOpen else { return }
+            self.card.orderOut(nil)
         })
     }
 
@@ -745,7 +405,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func toggleWidget() {
         widgetOn.toggle()
-        if widgetOn { placePill(); pill.orderFrontRegardless() } else { card.orderOut(nil); pill.orderOut(nil) }
+        if widgetOn { placePill(); pill.orderFrontRegardless() } else { closeCard(animated: false); pill.orderOut(nil) }
     }
     @objc func resetFromMenu() { resetPosition() }
     @objc func openUsage() { NSWorkspace.shared.open(USAGE_URL) }

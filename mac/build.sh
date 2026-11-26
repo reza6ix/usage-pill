@@ -21,7 +21,7 @@ YAML
   EXTRA=(-vfsoverlay build/overlay.yaml -Xcc -ivfsoverlay -Xcc build/overlay.yaml)
 fi
 
-swiftc -O -swift-version 5 ${EXTRA[@]+"${EXTRA[@]}"} -o "$APP/Contents/MacOS/UsagePill" main.swift \
+swiftc -O -swift-version 5 ${EXTRA[@]+"${EXTRA[@]}"} -o "$APP/Contents/MacOS/UsagePill" UI.swift main.swift \
   -framework AppKit -framework SwiftUI -framework Network -framework ServiceManagement
 cp Info.plist "$APP/Contents/Info.plist"
 codesign --force --sign - "$APP" >/dev/null

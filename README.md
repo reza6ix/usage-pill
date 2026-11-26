@@ -43,4 +43,10 @@ open ~/Applications/"Usage Pill.app"
 - **Browser extension**: shows whichever account claude.ai is logged into; the extension hands the numbers over
   locally on `127.0.0.1:47823`. While the app is running, the in-browser pill hides itself.
 
-Hover the pill for details, drag it anywhere, double-click to send it back to the corner.
+**Click** the pill for the full card (session, weekly, Refresh). It closes the moment you move away or click
+anywhere else. Drag the pill anywhere; *Reset widget position* in the menu bar sends it back to the corner.
+
+### Demo video
+
+`mac/promo/render.sh` renders the launch video (1080p60, ~14s) from the app's real SwiftUI views with ffmpeg.
+The numbers in it are demo values. `./mac/promo/render.sh 5.8` renders a single still at 5.8s.
