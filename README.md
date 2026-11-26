@@ -24,3 +24,23 @@ It reads the same endpoint claude.ai's own usage page uses (`/api/organizations/
 
 - Unofficial and not affiliated with Anthropic. The usage endpoint is undocumented and could change.
 - Chrome extensions can only draw inside Chrome, so the pill isn't shown over other apps.
+
+## Mac app: a pill that floats over everything
+
+Browser extensions can only draw inside the browser. `mac/` is a tiny native app that keeps the same pill
+floating over every app, Space and full-screen window, plus a menu-bar readout (`◔ 65% · 4h 18m`).
+
+```bash
+./mac/build.sh            # builds and installs ~/Applications/Usage Pill.app
+open ~/Applications/"Usage Pill.app"
+```
+
+**Pick the account** from the menu-bar item → *Account*:
+
+- **Claude Code · ~/.claude** (or any `~/.claude-*` folder, e.g. a second account run with `CLAUDE_CONFIG_DIR`).
+  The app reads that folder's Claude Code login from your Keychain and asks Anthropic for its usage every
+  2 minutes. The token never leaves your Mac except to `api.anthropic.com`, and is never stored or refreshed.
+- **Browser extension**: shows whichever account claude.ai is logged into; the extension hands the numbers over
+  locally on `127.0.0.1:47823`. While the app is running, the in-browser pill hides itself.
+
+Hover the pill for details, drag it anywhere, double-click to send it back to the corner.

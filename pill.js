@@ -93,7 +93,7 @@
 
   // ---------- render ----------
   function render() {
-    const visible = state.pillEnabled && !state.hiddenHosts.includes(HOST) && !document.fullscreenElement;
+    const visible = state.pillEnabled && !state.desktopApp && !state.hiddenHosts.includes(HOST) && !document.fullscreenElement;
     host.style.display = visible ? 'block' : 'none';
     if (!visible) return;
 
@@ -230,7 +230,7 @@
   });
 
   // ---------- wiring ----------
-  const KEYS = ['usage', 'status', 'error', 'pillEnabled', 'hiddenHosts', 'pillPos'];
+  const KEYS = ['usage', 'status', 'error', 'pillEnabled', 'hiddenHosts', 'pillPos', 'desktopApp'];
   chrome.storage.local.get(KEYS).then((s) => {
     for (const k of KEYS) if (s[k] != null) state[k] = s[k];
     (document.body || document.documentElement).appendChild(host);

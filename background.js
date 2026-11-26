@@ -98,8 +98,27 @@ async function save(raw, orgId) {
 
 // ---------- toolbar icon + badge ----------
 
+// ---------- desktop widget (mac/ app) ----------
+// Hand the latest numbers to the Usage Pill Mac app, if it's running. Silent if not.
+const DESKTOP = 'http://127.0.0.1:47823/usage';
+async function pushDesktop(usage, status) {
+  let ok = false;
+  try {
+    const r = await fetch(DESKTOP, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ limits: usage?.limits || [], fetchedAt: usage?.fetchedAt || null, status: status || null }),
+    });
+    ok = r.ok;
+  } catch (_) { /* app not running */ }
+  // While the Mac app is running, the in-page pill steps aside (no double pills).
+  const { desktopApp = false } = await chrome.storage.local.get('desktopApp');
+  if (desktopApp !== ok) chrome.storage.local.set({ desktopApp: ok });
+}
+
 async function paint() {
   const { usage, status } = await chrome.storage.local.get(['usage', 'status']);
+  pushDesktop(usage, status);
   const p = CU.primary(usage?.limits);
 
   if (status === 'signed_out' && !p) {
