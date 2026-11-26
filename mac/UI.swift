@@ -7,6 +7,9 @@ import Network
 import Combine
 import ServiceManagement
 import CryptoKit
+import os
+
+let LOG = Logger(subsystem: "com.reza6ix.usagepill", category: "fetch")
 
 let PORT: UInt16 = 47823
 let USAGE_URL = URL(string: "https://claude.ai/settings/usage")!
@@ -20,6 +23,7 @@ struct Limit: Codable, Identifiable, Equatable {
     let label: String
     let pct: Double
     let resetsAt: Double? // ms since epoch
+    var assumedReset: Bool? = nil // its reset time passed and we have no fresh numbers yet
     var id: String { key }
     var resetDate: Date? { resetsAt.map { Date(timeIntervalSince1970: $0 / 1000) } }
 }
@@ -62,6 +66,11 @@ final class Store: ObservableObject {
     @Published var pillHover = false
     @Published var cardOpen = false
     @Published var refreshing = false
+    /// Set when Anthropic says "slow down" (HTTP 429). Saved, so restarting the app doesn't skip the wait.
+    @Published var retryAt: Date? = UserDefaults.standard.object(forKey: "retryAt") as? Date {
+        didSet { UserDefaults.standard.set(retryAt, forKey: "retryAt") }
+    }
+    var waiting: Bool { retryAt.map { $0 > now } ?? false }
     @Published var source: String
 
     private var timer: Timer?
@@ -120,7 +129,15 @@ final class Store: ObservableObject {
         now = Date()
     }
 
-    var primary: Limit? { limits.first { $0.key == "five_hour" } ?? limits.first }
+    /// Limits as they stand right now: once a window's reset time has passed it is back to 0%,
+    /// even before the next fetch confirms it (never show a stale "100% · now").
+    var current: [Limit] {
+        limits.map { l in
+            guard let r = l.resetDate, r <= now else { return l }
+            return Limit(key: l.key, label: l.label, pct: 0, resetsAt: nil, assumedReset: true)
+        }
+    }
+    var primary: Limit? { current.first { $0.key == "five_hour" } ?? current.first }
     var stale: Bool { fetchedAt.map { now.timeIntervalSince($0) > 10 * 60 } ?? true }
     var browserConnected: Bool { lastPush.map { now.timeIntervalSince($0) < 5 * 60 } ?? false }
 }
@@ -176,17 +193,22 @@ enum ClaudeCode {
         return token
     }
 
-    static func fetch(_ dir: String, done: @escaping (Int, [String: Any]?) -> Void) {
+    static func fetch(_ dir: String, done: @escaping (Int, [String: Any]?, TimeInterval?) -> Void) {
         DispatchQueue.global(qos: .utility).async {
-            guard let token = accessToken(dir) else { return DispatchQueue.main.async { done(-1, nil) } }
+            guard let token = accessToken(dir) else { return DispatchQueue.main.async { done(-1, nil, nil) } }
             var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!, timeoutInterval: 15)
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
             req.setValue("application/json", forHTTPHeaderField: "Accept")
+            req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData // never show a cached, stale answer
             URLSession.shared.dataTask(with: req) { data, resp, _ in
-                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                let http = resp as? HTTPURLResponse
+                let code = http?.statusCode ?? 0
+                let retry = (http?.value(forHTTPHeaderField: "Retry-After")).flatMap(TimeInterval.init)
                 let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-                DispatchQueue.main.async { done(code, json) }
+                // Status code only — never the token or the response body.
+                LOG.notice("usage fetch: HTTP \(code, privacy: .public), retry-after \(retry.map { String(Int($0)) } ?? "none", privacy: .public)")
+                DispatchQueue.main.async { done(code, json, retry) }
             }.resume()
         }
     }
@@ -206,6 +228,12 @@ enum Fmt {
         if h < 24 { return mm > 0 ? "\(h)h \(mm)m" : "\(h)h" }
         let dd = h / 24, hh = h % 24
         return hh > 0 ? "\(dd)d \(hh)h" : "\(dd)d"
+    }
+    /// Pill / menu-bar text for a limit's time slot.
+    static func short(_ l: Limit, now: Date) -> String {
+        if l.assumedReset == true { return "reset" }        // window just ended; fresh numbers on the way
+        if l.resetDate == nil { return "not started" }      // no 5h window running until you send a message
+        return left(l.resetDate, now: now)
     }
     static func resetAt(_ d: Date) -> String {
         let f = DateFormatter()
@@ -263,7 +291,7 @@ struct PillView: View {
             Text(p.map { "\(Int($0.pct.rounded()))%" } ?? "—")
                 .font(.system(size: 12, weight: .semibold))
             Rectangle().fill(Color.white.opacity(0.16)).frame(width: 1, height: 12)
-            Text(p.map { $0.resetDate == nil ? "idle" : Fmt.left($0.resetDate, now: store.now) } ?? "Claude")
+            Text(p.map { Fmt.short($0, now: store.now) } ?? "Claude")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(Style.fg.opacity(0.62))
         }
@@ -320,9 +348,9 @@ struct LimitRow: View {
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 2) {
-                    Text(limit.resetDate != nil ? Fmt.left(limit.resetDate, now: now) : "—")
+                    Text(limit.assumedReset == true ? "reset" : limit.resetDate != nil ? Fmt.left(limit.resetDate, now: now) : "—")
                         .font(.system(size: 13, weight: .semibold))
-                    Text(limit.resetDate.map { "resets \(Fmt.resetAt($0))" } ?? "starts on next message")
+                    Text(limit.assumedReset == true ? "updating…" : limit.resetDate.map { "resets \(Fmt.resetAt($0))" } ?? "starts with your next message")
                         .font(.system(size: 11)).foregroundColor(Style.muted)
                 }
             }
@@ -343,6 +371,7 @@ struct CardView: View {
         case "expired": return "Claude Code's login for this account expired. Run it once (it refreshes itself), then hit Refresh."
         case "signed_out": return "You're signed out of claude.ai in your browser."
         case "error": return "Couldn't load usage. Check your connection and hit Refresh."
+        case "rate_limited": return "Anthropic asked us to slow down. It retries automatically in a few minutes."
         default:
             if store.isBrowser && store.lastPush == nil { return "Waiting for the browser extension. Keep your browser open with Usage Pill installed." }
             return "Loading…"
@@ -351,7 +380,17 @@ struct CardView: View {
 
     var footer: String {
         if store.isBrowser && !store.browserConnected && store.fetchedAt != nil { return "Browser closed · \(Fmt.ago(store.fetchedAt, now: store.now))" }
-        if store.status == "expired" || store.status == "error" || store.status == "no_login" { return store.fetchedAt == nil ? "Not updated" : "Offline · \(Fmt.ago(store.fetchedAt, now: store.now))" }
+        // Say *why* it isn't updating, not just "Offline".
+        let ago = store.fetchedAt == nil ? "" : " · data \(Fmt.ago(store.fetchedAt, now: store.now))"
+        switch store.status {
+        case "expired": return "Login expired" + ago
+        case "no_login": return "No Claude Code login"
+        case "rate_limited":
+            if let r = store.retryAt, r > store.now { return "Busy · retry in \(Fmt.left(r, now: store.now))" }
+            return "Busy · retrying" + ago
+        case "error": return "Can't reach Anthropic" + ago
+        default: break
+        }
         return "Updated \(Fmt.ago(store.fetchedAt, now: store.now))"
     }
 
@@ -370,7 +409,7 @@ struct CardView: View {
                 Text(message).font(.system(size: 12)).foregroundColor(Style.fg.opacity(0.75))
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                ForEach(Array(store.limits.enumerated()), id: \.element.id) { i, l in
+                ForEach(Array(store.current.enumerated()), id: \.element.id) { i, l in
                     LimitRow(limit: l, now: store.now).padding(.top, i == 0 ? 0 : 18)
                 }
             }
@@ -382,8 +421,10 @@ struct CardView: View {
                 if store.isBrowser {
                     PillButton(title: "Usage page", icon: "arrow.up.right", action: onOpen)
                 } else {
-                    PillButton(title: store.refreshing ? "Refreshing" : "Refresh", icon: "arrow.clockwise",
+                    PillButton(title: store.refreshing ? "Refreshing" : store.waiting ? "Wait \(Fmt.left(store.retryAt, now: store.now))" : "Refresh",
+                               icon: store.waiting ? "hourglass" : "arrow.clockwise",
                                spinning: store.refreshing, action: onRefresh)
+                        .disabled(store.waiting).opacity(store.waiting ? 0.5 : 1)
                 }
             }
             .padding(.top, 12)

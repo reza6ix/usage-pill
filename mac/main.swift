@@ -153,7 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pill = FloatingPanel(view: pillHost)
 
         cardHost = HoverHostingView(rootView: CardView(store: store,
-                                                       onRefresh: { [weak self] in self?.fetchNow() },
+                                                       onRefresh: { [weak self] in self?.fetchNow(manual: true) },
                                                        onOpen: { NSWorkspace.shared.open(USAGE_URL) }))
         cardHost.sizingOptions = []
         cardHost.hotInset = CARD_PAD
@@ -185,36 +185,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh()
 
         fetchNow()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in self?.fetchNow() }
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 180, repeats: true) { [weak self] _ in self?.fetchNow() }
+        // When a window's reset time passes, fetch the fresh numbers instead of waiting for the next poll.
+        resetTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.store.now = Date()
+            let fetched = self.store.fetchedAt ?? .distantPast
+            let justReset = self.store.limits.contains { l in
+                guard let r = l.resetDate else { return false }
+                return r <= Date() && fetched < r.addingTimeInterval(30)
+            }
+            if justReset && Date().timeIntervalSince(self.lastAttempt) > 60 { self.fetchNow() }
+        }
     }
 
     // --- Claude Code source: poll the account's usage directly ---
 
     var pollTimer: Timer?
+    var resetTimer: Timer?
 
     func fetchNow() {
+        fetchNow(manual: false)
+    }
+
+    var lastAttempt = Date.distantPast
+    var backoff: TimeInterval = 0
+
+    func fetchNow(manual: Bool) {
         let src = store.source
         guard src != Sources.browser, !store.refreshing else { return }
+        // While Anthropic has asked us to wait, nothing (not even Refresh) asks again — extra
+        // requests only extend the block.
+        if let r = store.retryAt, r > Date() { store.now = Date(); return }
         store.refreshing = true
-        ClaudeCode.fetch(src) { [weak self] code, json in
+        lastAttempt = Date()
+        ClaudeCode.fetch(src) { [weak self] code, json, retryAfter in
             guard let self else { return }
             self.store.refreshing = false
             guard self.store.source == src else { return } // switched accounts mid-request
             switch code {
-            case 200: if let json { self.store.applyRaw(json) } else { self.store.status = "error" }
+            case 200:
+                self.backoff = 0; self.store.retryAt = nil
+                if let json { self.store.applyRaw(json) } else { self.store.status = "error" }
             case -1: self.store.status = "no_login"
             case 401, 403: self.store.status = "expired"
+            case 429:
+                // Back off: honour Retry-After, else 2 → 4 → 8 … up to 30 minutes.
+                self.backoff = min(max(self.backoff * 2, 120), 1800)
+                self.store.retryAt = Date().addingTimeInterval(retryAfter ?? self.backoff)
+                self.store.status = "rate_limited"
             default: self.store.status = "error"
             }
+            self.store.now = Date()
         }
     }
 
     @objc func pickSource(_ item: NSMenuItem) {
         guard let s = item.representedObject as? String else { return }
         store.setSource(s)
-        fetchNow()
+        backoff = 0
+        fetchNow(manual: true)
     }
-    @objc func refreshFromMenu() { fetchNow() }
+    @objc func refreshFromMenu() { fetchNow(manual: true) }
 
     // --- layout ---
 
@@ -360,8 +392,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        for l in store.limits {
-            let reset = l.resetDate.map { " · resets in \(Fmt.left($0, now: Date()))" } ?? ""
+        for l in store.current {
+            let reset = l.resetDate.map { " · resets in \(Fmt.left($0, now: Date()))" } ?? " · \(Fmt.short(l, now: Date()))"
             let item = NSMenuItem(title: "\(l.label): \(Int(l.pct.rounded()))%\(reset)", action: nil, keyEquivalent: "")
             item.isEnabled = false
             menu.addItem(item)
@@ -426,7 +458,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let p = store.primary
         b.image = ringImage(p?.pct)
         b.imagePosition = .imageLeading
-        let text = p.map { " \(Int($0.pct.rounded()))%" + ($0.resetDate.map { " · \(Fmt.left($0, now: store.now))" } ?? "") } ?? " —"
+        let text = p.map { " \(Int($0.pct.rounded()))% · \(Fmt.short($0, now: store.now))" } ?? " —"
         b.attributedTitle = NSAttributedString(string: text, attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
         ])
