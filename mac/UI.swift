@@ -139,6 +139,8 @@ final class Store: ObservableObject {
     }
     var primary: Limit? { current.first { $0.key == "five_hour" } ?? current.first }
     var stale: Bool { fetchedAt.map { now.timeIntervalSince($0) > 10 * 60 } ?? true }
+    /// Fetched under a minute ago: Refresh rests, so rapid clicks can't trip Anthropic's rate limit.
+    var fresh: Bool { fetchedAt.map { now.timeIntervalSince($0) < 60 } ?? false }
     var browserConnected: Bool { lastPush.map { now.timeIntervalSince($0) < 5 * 60 } ?? false }
 }
 
@@ -424,7 +426,7 @@ struct CardView: View {
                     PillButton(title: store.refreshing ? "Refreshing" : store.waiting ? "Wait \(Fmt.left(store.retryAt, now: store.now))" : "Refresh",
                                icon: store.waiting ? "hourglass" : "arrow.clockwise",
                                spinning: store.refreshing, action: onRefresh)
-                        .disabled(store.waiting).opacity(store.waiting ? 0.5 : 1)
+                        .disabled(store.waiting || store.fresh).opacity(store.waiting || store.fresh ? 0.5 : 1)
                 }
             }
             .padding(.top, 12)

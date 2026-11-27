@@ -217,6 +217,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // While Anthropic has asked us to wait, nothing (not even Refresh) asks again — extra
         // requests only extend the block.
         if let r = store.retryAt, r > Date() { store.now = Date(); return }
+        // Anthropic's usage endpoint 429s after a handful of quick calls, so a manual Refresh
+        // within a minute of the last request is a no-op.
+        if manual && Date().timeIntervalSince(lastAttempt) < 60 { store.now = Date(); return }
         store.refreshing = true
         lastAttempt = Date()
         ClaudeCode.fetch(src) { [weak self] code, json, retryAfter in
